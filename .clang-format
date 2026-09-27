@@ -1,0 +1,14 @@
+# for formatting C++ code with clang-format, you can use this configuration file.
+# to use it, run: clang-format -i path/to/file.cpp
+# example: clang-format -i src/main.cpp
+
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -2
+NamespaceIndentation: None
+SortIncludes: true
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: Empty
+BreakConstructorInitializers: BeforeColon
