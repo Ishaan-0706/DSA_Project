@@ -16,6 +16,3 @@ cmake_install.cmake
 .vscode/
 .idea/
 .DS_Store
-
-# Testing
-sample/
