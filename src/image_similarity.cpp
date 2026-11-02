@@ -1,8 +1,10 @@
 #include "blockdedup/image_similarity.hpp"
 #define STB_IMAGE_IMPLEMENTATION
 #include "third_party/stb_image.h"
+#ifdef BLOCKDEDUP_HAS_EXIV2
 #include <exiv2/exiv2.hpp>
 #include <exiv2/preview.hpp>
+#endif
 #include <cmath>
 #include <iostream>
 #include <algorithm>
@@ -13,6 +15,7 @@ ImageBuffer ImageSimilarityScanner::loadImage(const std::string& filepath, int d
     ImageBuffer buf;
     int w = 0, h = 0, c = 0;
     unsigned char* raw = stbi_load(filepath.c_str(), &w, &h, &c, desiredChannels);
+#ifdef BLOCKDEDUP_HAS_EXIV2
     if (!raw) {
         // Fallback: If it's a camera RAW file, extract embedded JPEG preview using Exiv2
         try {
@@ -31,6 +34,7 @@ ImageBuffer ImageSimilarityScanner::loadImage(const std::string& filepath, int d
             // Ignore exiv2 preview extraction failures
         }
     }
+#endif
 
     if (!raw) {
         return buf;
@@ -323,7 +327,7 @@ std::vector<VisualGroup> ImageSimilarityScanner::groupSimilarImages(
             for (size_t vIdx : unassigned) {
                 if (uIdx == vIdx) continue;
                 double ratio = computeBackgroundMatchRatio(cached[uIdx].thumbnail, cached[vIdx].thumbnail, 35);
-                if (ratio >= 0.70) {
+                if (ratio >= minBackgroundRatio) {
                     connected++;
                 }
             }
@@ -347,7 +351,7 @@ std::vector<VisualGroup> ImageSimilarityScanner::groupSimilarImages(
             SpatialAlignment align;
 
             // Only admit candidates that have strong overlap (>= 70%) with this specific master
-            if (ratio >= 0.70) {
+            if (ratio >= minBackgroundRatio) {
                 align.matchScore = ratio;
                 align.isAligned = true;
                 align.dx = 0;
@@ -360,7 +364,7 @@ std::vector<VisualGroup> ImageSimilarityScanner::groupSimilarImages(
                 count++;
             } else {
                 align = estimateAlignment(cached[bestMasterIdx].thumbnail, cached[j].thumbnail, cached[bestMasterIdx].meta.width, cached[bestMasterIdx].meta.height, 35);
-                if (align.matchScore >= 0.70) {
+                if (align.matchScore >= minBackgroundRatio) {
                     grp.slaves.push_back(cached[j].meta);
                     grp.slaveAlignments.push_back(align);
                     cached[j].assigned = true;

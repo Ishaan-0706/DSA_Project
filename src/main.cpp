@@ -7,6 +7,9 @@
 #include <vector>
 #include <filesystem>
 #include <iomanip>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
 
 namespace fs = std::filesystem;
 using namespace blockdedup;
@@ -17,9 +20,11 @@ void printUsage(const char* prog) {
               << "  inspect <image_path>               Parse & inspect EXIF/XMP & GPS telemetry\n"
               << "  tree <image_dir>                   Build & display Spatiotemporal Cluster Tree\n"
               << "  scan <image_dir>                   Tree clustering + visual scanning (find Masters & Slaves)\n"
-              << "  compress <image_dir> <out_dir>     Run Master/Delta compression across image clusters\n"
-              << "  decompress <master> <delta> <out>  Reconstruct target image from Master and Delta file\n"
-              << "  demo [image_dir]                   Run complete automated demonstration & benchmark\n\n";
+              << "  compress <image_dir> <out_dir> [tolerance]\n"
+              << "                                     Master/delta archive. Default tolerance 28\n"
+              << "  decompress <master> <delta> <out>  Reconstruct one image from a master and a delta\n"
+              << "  restore <archive_dir> <out_dir>    Reconstruct every image in an archive\n"
+              << "  demo [image_dir]                   Inspect, cluster, compress, and restore\n\n";
 }
 
 void commandInspect(const std::string& path) {
@@ -116,7 +121,9 @@ void commandScan(const std::string& dir) {
 }
 
 #include <atomic>
+#ifdef BLOCKDEDUP_HAS_OPENMP
 #include <omp.h>
+#endif
 #include "third_party/stb_image_write.h"
 
 void commandCompress(const std::string& dir, const std::string& outDir, uint8_t tolerance = 28) {
@@ -173,6 +180,8 @@ void commandCompress(const std::string& dir, const std::string& outDir, uint8_t 
                 std::cerr << "  Failed to decode master image: " << grp.master.filepath << "\n";
                 continue;
             }
+            const int loadedW = masterImg.width;
+            const int loadedH = masterImg.height;
 
             // Expand master canvas with missing borders from any slaves that extend beyond (capped)
             for (size_t sIdx = 0; sIdx < grp.slaves.size(); ++sIdx) {
@@ -190,7 +199,7 @@ void commandCompress(const std::string& dir, const std::string& outDir, uint8_t 
             // Copy/save master image
             fs::path masterOut = clusterOutDir / ("master_" + grp.master.filename);
             size_t mSize = 0;
-            if (masterImg.width != grp.master.width || masterImg.height != grp.master.height) {
+            if (masterImg.width != loadedW || masterImg.height != loadedH) {
                 stbi_write_jpg(masterOut.string().c_str(), masterImg.width, masterImg.height, masterImg.channels, masterImg.data.data(), 95);
             } else {
                 fs::copy_file(grp.master.filepath, masterOut, fs::copy_options::overwrite_existing);
@@ -211,9 +220,7 @@ void commandCompress(const std::string& dir, const std::string& outDir, uint8_t 
                 continue;
             }
 
-            // For photographic camera bursts with fine sensor noise, default tolerance 35 provides >85% compression
-            uint8_t effTolerance = std::max<uint8_t>(tolerance, 35);
-            std::cout << "  Encoding " << grp.slaves.size() << " images as deltas with spatial alignment (tolerance: " << (int)effTolerance << ")...\n";
+            std::cout << "  Encoding " << grp.slaves.size() << " images as deltas with spatial alignment (tolerance: " << (int)tolerance << ")...\n";
 
             std::atomic<size_t> grpOrig{0};
             std::atomic<size_t> grpComp{0};
@@ -228,9 +235,11 @@ void commandCompress(const std::string& dir, const std::string& outDir, uint8_t 
                     align = grp.slaveAlignments[sIdx];
                 }
 
-                fs::path deltaOut = clusterOutDir / (slave.filename + ".bdelta");
+                // shortcut: a filename containing @@ links to the wrong master, rename that file.
+                std::string masterStored = "master_" + grp.master.filename;
+                fs::path deltaOut = clusterOutDir / (masterStored + "@@" + slave.filename + ".bdelta");
                 CompressionReport report;
-                if (DeltaCompressor::createDeltaWithMaster(masterImg, grp.master.filepath, slave.filepath, deltaOut.string(), effTolerance, align, &report)) {
+                if (DeltaCompressor::createDeltaWithMaster(masterImg, grp.master.filepath, slave.filepath, deltaOut.string(), tolerance, align, &report)) {
                     if (report.deltaBytes < report.originalBytes) {
                         grpOrig += report.originalBytes;
                         grpComp += report.deltaBytes;
@@ -346,10 +355,10 @@ void commandRestoreArchive(const std::string& archiveDir, const std::string& rec
 
         for (const auto& file : fs::directory_iterator(cDir)) {
             std::string name = file.path().filename().string();
-            if (name.rfind("master_", 0) == 0) {
-                masters.push_back(file.path());
-            } else if (name.size() > 7 && name.substr(name.size() - 7) == ".bdelta") {
+            if (name.size() > 7 && name.substr(name.size() - 7) == ".bdelta") {
                 deltas.push_back(file.path());
+            } else if (name.rfind("master_", 0) == 0) {
+                masters.push_back(file.path());
             } else if (file.is_regular_file()) {
                 standalones.push_back(file.path());
             }
@@ -381,14 +390,21 @@ void commandRestoreArchive(const std::string& archiveDir, const std::string& rec
         for (size_t dIdx = 0; dIdx < deltas.size(); ++dIdx) {
             const auto& d = deltas[dIdx];
             std::string dName = d.filename().string();
-            std::string targetName = dName.substr(0, dName.size() - 7); // strip ".bdelta"
+            std::string stem = dName.substr(0, dName.size() - 7); // strip ".bdelta"
+            auto marker = stem.find("@@");
+            std::string targetName = marker == std::string::npos ? stem : stem.substr(marker + 2);
             fs::path dest = fs::path(reconDir) / targetName;
 
             bool restored = false;
-            for (const auto& m : masters) {
-                if (DeltaCompressor::reconstructImage(m.string(), d.string(), dest.string())) {
-                    restored = true;
-                    break;
+            if (marker != std::string::npos) {
+                fs::path masterPath = cDir / stem.substr(0, marker);
+                restored = DeltaCompressor::reconstructImage(masterPath.string(), d.string(), dest.string());
+            } else {
+                for (const auto& m : masters) {
+                    if (DeltaCompressor::reconstructImage(m.string(), d.string(), dest.string())) {
+                        restored = true;
+                        break;
+                    }
                 }
             }
 
@@ -437,7 +453,7 @@ int main(int argc, char* argv[]) {
     } else if (cmd == "scan" && argc >= 3) {
         commandScan(argv[2]);
     } else if (cmd == "compress" && argc >= 4) {
-        uint8_t tol = (argc >= 5) ? static_cast<uint8_t>(std::stoi(argv[4])) : 20;
+        uint8_t tol = (argc >= 5) ? static_cast<uint8_t>(std::stoi(argv[4])) : 28;
         commandCompress(argv[2], argv[3], tol);
     } else if (cmd == "decompress" && argc >= 5) {
         commandDecompress(argv[2], argv[3], argv[4]);
@@ -454,6 +470,14 @@ int main(int argc, char* argv[]) {
 
         std::cout << "\n>>> STEP 3: Visual Scanning & Master/Slave Grouping <<<\n";
         commandScan(dir);
+
+        fs::path in = dir;
+        fs::path archive = in.parent_path() / (in.filename().string() + "_archive");
+        fs::path restored = in.parent_path() / (in.filename().string() + "_restored");
+        std::cout << "\n>>> STEP 4: Compress <<<\n";
+        commandCompress(dir, archive.string(), 28);
+        std::cout << "\n>>> STEP 5: Restore <<<\n";
+        commandRestoreArchive(archive.string(), restored.string());
     } else {
         printUsage(argv[0]);
         return 1;

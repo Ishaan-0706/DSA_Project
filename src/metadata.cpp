@@ -1,5 +1,7 @@
 #include "blockdedup/metadata.hpp"
+#ifdef BLOCKDEDUP_HAS_EXIV2
 #include <exiv2/exiv2.hpp>
+#endif
 #include <filesystem>
 #include <sstream>
 #include <iomanip>
@@ -10,6 +12,7 @@ namespace blockdedup {
 
 namespace {
 
+#ifdef BLOCKDEDUP_HAS_EXIV2
 // Helper to convert GPS rational string (e.g. "28/1 34/1 1234/100") to decimal degrees
 double parseGpsCoordinate(const Exiv2::Value& val, const std::string& ref) {
     if (val.count() < 3) return 0.0;
@@ -44,6 +47,7 @@ int64_t parseExifTimestamp(const std::string& str) {
     }
     return 0;
 }
+#endif
 
 } // namespace
 
@@ -58,6 +62,7 @@ std::optional<ImageMetadata> MetadataExtractor::extract(const std::string& filep
         meta.filename = std::filesystem::path(filepath).filename().string();
         meta.fileSize = std::filesystem::file_size(filepath);
 
+#ifdef BLOCKDEDUP_HAS_EXIV2
         auto image = Exiv2::ImageFactory::open(filepath);
         if (!image.get()) return std::nullopt;
 
@@ -119,6 +124,7 @@ std::optional<ImageMetadata> MetadataExtractor::extract(const std::string& filep
         for (auto it = xmpData.begin(); it != xmpData.end(); ++it) {
             meta.allTags[it->key()] = it->value().toString();
         }
+#endif
 
         // Fallback: If no timestamp in EXIF, use filesystem modification time
         if (!meta.hasTimestamp) {
@@ -133,9 +139,11 @@ std::optional<ImageMetadata> MetadataExtractor::extract(const std::string& filep
 
         return meta;
 
+#ifdef BLOCKDEDUP_HAS_EXIV2
     } catch (const Exiv2::Error& e) {
         std::cerr << "Exiv2 error for " << filepath << ": " << e.what() << "\n";
         return std::nullopt;
+#endif
     } catch (const std::exception& e) {
         std::cerr << "Exception reading " << filepath << ": " << e.what() << "\n";
         return std::nullopt;

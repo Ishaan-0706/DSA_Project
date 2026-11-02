@@ -6,6 +6,7 @@ build/
 *.so
 *.dll
 *.exe
+ponytail/
 
 # CMake
 CMakeCache.txt
