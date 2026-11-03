@@ -7,6 +7,11 @@ build/
 *.dll
 *.exe
 ponytail/
+masters/
+dataset/
+archive_dataset/
+restored_dataset/
+.cache/
 
 # CMake
 CMakeCache.txt
