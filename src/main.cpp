@@ -10,6 +10,14 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <random>
+#include <atomic>
+
+#ifdef BLOCKDEDUP_HAS_OPENMP
+#include <omp.h>
+#endif
+#include "third_party/stb_image_write.h"
 
 namespace fs = std::filesystem;
 using namespace blockdedup;
@@ -20,10 +28,10 @@ void printUsage(const char* prog) {
               << "  inspect <image_path>               Parse & inspect EXIF/XMP & GPS telemetry\n"
               << "  tree <image_dir>                   Build & display Spatiotemporal Cluster Tree\n"
               << "  scan <image_dir>                   Tree clustering + visual scanning (find Masters & Slaves)\n"
-              << "  compress <image_dir> <out_dir> [tolerance]\n"
-              << "                                     Master/delta archive. Default tolerance 28\n"
+              << "  compress <image_dir> <out_archive> [tolerance]\n"
+              << "                                     Generate packaged .meta archive. Default tolerance 28\n"
               << "  decompress <master> <delta> <out>  Reconstruct one image from a master and a delta\n"
-              << "  restore <archive_dir> <out_dir>    Reconstruct every image in an archive\n"
+              << "  restore <archive> <out_dir>        Reconstruct every image from a .meta or legacy archive\n"
               << "  demo [image_dir]                   Inspect, cluster, compress, and restore\n\n";
 }
 
@@ -61,8 +69,7 @@ std::vector<ImageMetadata> collectImages(const std::string& dir) {
     for (const auto& entry : fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied, ec)) {
         if (!entry.is_regular_file()) continue;
         std::string pStr = entry.path().string();
-        // Skip output directories or delta files
-        if (pStr.find("compressed") != std::string::npos || pStr.find(".bdelta") != std::string::npos) {
+        if (pStr.find("compressed") != std::string::npos || pStr.find(".bdelta") != std::string::npos || pStr.find(".meta") != std::string::npos) {
             continue;
         }
 
@@ -83,7 +90,7 @@ void commandTree(const std::string& dir) {
         std::cout << "No images found in " << dir << "\n";
         return;
     }
-    SpatiotemporalClusterTree tree(50.0, 300); // 50m radius, 5 min window
+    SpatiotemporalClusterTree tree(50.0, 300);
     tree.build(images);
     tree.printTree();
 }
@@ -120,70 +127,60 @@ void commandScan(const std::string& dir) {
     std::cout << "==========================================\n";
 }
 
-#include <atomic>
-#ifdef BLOCKDEDUP_HAS_OPENMP
-#include <omp.h>
-#endif
-#include "third_party/stb_image_write.h"
-
-void commandCompress(const std::string& dir, const std::string& outDir, uint8_t tolerance = 28) {
+bool commandCompress(const std::string& dir, const std::string& outArchiveTarget, uint8_t tolerance = 28) {
     auto images = collectImages(dir);
     if (images.empty()) {
-        std::cout << "No images found in " << dir << "\n";
-        return;
+        std::cerr << "Error: No images found in " << dir << "\n";
+        return false;
     }
-    fs::create_directories(outDir);
 
-    std::cout << "=== Starting Archival Pipeline ===\n";
-    std::cout << "Discovered " << images.size() << " image files.\n";
+    std::string finalArchivePath = MetadataArchive::ensureMetaExtension(outArchiveTarget);
 
-    std::cout << "Building Spatiotemporal Cluster Tree...\n";
+    if (fs::exists(finalArchivePath)) {
+        std::cerr << "Error: Archive file already exists: " << finalArchivePath 
+                  << ". Aborting to prevent accidental overwriting.\n";
+        return false;
+    }
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist(100000, 999999);
+    fs::path stagingDir = fs::temp_directory_path() / ("blockdedup_stage_" + std::to_string(dist(gen)));
+
+    std::error_code ec;
+    fs::create_directories(stagingDir, ec);
+    if (ec) {
+        std::cerr << "Error: Failed to create temporary staging directory: " << ec.message() << "\n";
+        return false;
+    }
+
+    ArchiveManifest manifest;
+    manifest.formatVersion = "1.0";
+    manifest.formatTag = "blockdedup.meta";
+    manifest.creationTimestamp = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    manifest.totalOriginalImages = images.size();
+    manifest.tolerance = tolerance;
+
     SpatiotemporalClusterTree tree(50.0, 300);
     tree.build(images);
     auto clusters = tree.getNamedClusters();
 
-    std::cout << "Tree partitioned images into " << clusters.size() << " distinct category/session clusters.\n";
-
-    size_t totalOriginal = 0;
-    size_t totalCompressed = 0;
-    size_t masterCount = 0;
-    size_t deltaCount = 0;
-
-    struct FolderStats {
-        std::string folderName;
-        std::string description;
-        size_t originalBytes = 0;
-        size_t archivedBytes = 0;
-        size_t masters = 0;
-        size_t deltas = 0;
-    };
-    std::vector<FolderStats> clusterStats;
-
+    bool pipelineSuccess = true;
     for (const auto& cluster : clusters) {
-        fs::path clusterOutDir = fs::path(outDir) / cluster.folderName;
-        fs::create_directories(clusterOutDir);
-
-        FolderStats stats;
-        stats.folderName = cluster.folderName;
-        stats.description = cluster.description;
-
-        std::cout << "\n--------------------------------------------------\n";
-        std::cout << ">>> Processing: " << cluster.description << "\n";
-        std::cout << "    Destination Folder: " << clusterOutDir.string() << "\n";
-        std::cout << "    Candidate Images:   " << cluster.images.size() << "\n";
+        fs::path clusterOutDir = stagingDir / cluster.folderName;
+        fs::create_directories(clusterOutDir, ec);
 
         auto visualGroups = ImageSimilarityScanner::groupSimilarImages(cluster.images, 0.40);
         for (const auto& grp : visualGroups) {
-            // Check if master needs canvas expansion from any aligned slaves
             ImageBuffer masterImg = ImageSimilarityScanner::loadImage(grp.master.filepath, 3);
             if (!masterImg.isValid()) {
-                std::cerr << "  Failed to decode master image: " << grp.master.filepath << "\n";
-                continue;
+                std::cerr << "Error: Failed to decode master image: " << grp.master.filepath << "\n";
+                pipelineSuccess = false;
+                break;
             }
             const int loadedW = masterImg.width;
             const int loadedH = masterImg.height;
 
-            // Expand master canvas with missing borders from any slaves that extend beyond (capped)
             for (size_t sIdx = 0; sIdx < grp.slaves.size(); ++sIdx) {
                 if (sIdx < grp.slaveAlignments.size()) {
                     const auto& align = grp.slaveAlignments[sIdx];
@@ -196,36 +193,44 @@ void commandCompress(const std::string& dir, const std::string& outDir, uint8_t 
                 }
             }
 
-            // Copy/save master image
             fs::path masterOut = clusterOutDir / ("master_" + grp.master.filename);
-            size_t mSize = 0;
             if (masterImg.width != loadedW || masterImg.height != loadedH) {
-                stbi_write_jpg(masterOut.string().c_str(), masterImg.width, masterImg.height, masterImg.channels, masterImg.data.data(), 95);
+                int written = stbi_write_jpg(masterOut.string().c_str(), masterImg.width, masterImg.height, masterImg.channels, masterImg.data.data(), 95);
+                if (written == 0 || !fs::exists(masterOut)) {
+                    std::cerr << "Error: Failed to write master image: " << masterOut.string() << "\n";
+                    pipelineSuccess = false;
+                    break;
+                }
             } else {
-                fs::copy_file(grp.master.filepath, masterOut, fs::copy_options::overwrite_existing);
+                std::error_code mEc;
+                fs::copy_file(grp.master.filepath, masterOut, fs::copy_options::overwrite_existing, mEc);
+                if (mEc || !fs::exists(masterOut)) {
+                    std::cerr << "Error: Failed to copy master image: " << mEc.message() << "\n";
+                    pipelineSuccess = false;
+                    break;
+                }
             }
-            mSize = fs::file_size(masterOut);
-            totalOriginal += grp.master.fileSize;
-            totalCompressed += mSize;
-            stats.originalBytes += grp.master.fileSize;
-            stats.archivedBytes += mSize;
-            masterCount++;
-            stats.masters++;
 
-            std::cout << "\n  [MASTER SAVED] " << masterOut.filename().string() 
-                      << " (" << masterImg.width << "x" << masterImg.height << ", "
-                      << std::fixed << std::setprecision(2) << (mSize / 1024.0 / 1024.0) << " MB)\n";
+            ImageManifestEntry mEntry;
+            mEntry.originalFilename = grp.master.filename;
+            mEntry.clusterFolder = cluster.folderName;
+            mEntry.originalSizeBytes = grp.master.fileSize;
+            mEntry.sha256Checksum = MetadataArchive::computeSha256(grp.master.filepath);
+            mEntry.isMaster = true;
+            mEntry.masterReference = "";
+            manifest.entries.push_back(mEntry);
 
             if (grp.slaves.empty()) {
                 continue;
             }
 
-            std::cout << "  Encoding " << grp.slaves.size() << " images as deltas with spatial alignment (tolerance: " << (int)tolerance << ")...\n";
-
-            std::atomic<size_t> grpOrig{0};
-            std::atomic<size_t> grpComp{0};
-            std::atomic<size_t> grpDeltas{0};
-            std::atomic<size_t> progress{0};
+            enum class SlaveStorageType { NONE, DELTA, STANDALONE };
+            struct SlaveResult {
+                SlaveStorageType type = SlaveStorageType::NONE;
+                bool success = false;
+                std::string error;
+            };
+            std::vector<SlaveResult> slaveResults(grp.slaves.size());
 
             #pragma omp parallel for schedule(dynamic)
             for (size_t sIdx = 0; sIdx < grp.slaves.size(); ++sIdx) {
@@ -235,78 +240,75 @@ void commandCompress(const std::string& dir, const std::string& outDir, uint8_t 
                     align = grp.slaveAlignments[sIdx];
                 }
 
-                // shortcut: a filename containing @@ links to the wrong master, rename that file.
                 std::string masterStored = "master_" + grp.master.filename;
                 fs::path deltaOut = clusterOutDir / (masterStored + "@@" + slave.filename + ".bdelta");
                 CompressionReport report;
-                if (DeltaCompressor::createDeltaWithMaster(masterImg, grp.master.filepath, slave.filepath, deltaOut.string(), tolerance, align, &report)) {
-                    if (report.deltaBytes < report.originalBytes) {
-                        grpOrig += report.originalBytes;
-                        grpComp += report.deltaBytes;
-                        grpDeltas++;
-                    } else {
-                        // Delta did not shrink file; keep original file standalone
-                        std::error_code ec;
-                        fs::remove(deltaOut, ec);
-                        fs::copy_file(slave.filepath, clusterOutDir / slave.filename, fs::copy_options::overwrite_existing, ec);
-                        grpOrig += report.originalBytes;
-                        grpComp += report.originalBytes;
-                    }
-                }
+                bool deltaOk = DeltaCompressor::createDeltaWithMaster(
+                    masterImg, grp.master.filepath, slave.filepath, deltaOut.string(), tolerance, align, &report);
 
-                size_t p = ++progress;
-                if (p % 10 == 0 || p == grp.slaves.size()) {
-                    #pragma omp critical
-                    {
-                        std::cout << "    [Progress] " << p << " / " << grp.slaves.size() << " deltas generated\n";
+                if (deltaOk && report.deltaBytes < report.originalBytes) {
+                    slaveResults[sIdx].type = SlaveStorageType::DELTA;
+                    slaveResults[sIdx].success = true;
+                } else {
+                    // Fallback to standalone original copy
+                    std::error_code rmEc;
+                    if (deltaOk) {
+                        fs::remove(deltaOut, rmEc);
+                    }
+                    std::error_code cpEc;
+                    fs::path standaloneOut = clusterOutDir / slave.filename;
+                    fs::copy_file(slave.filepath, standaloneOut, fs::copy_options::overwrite_existing, cpEc);
+                    if (!cpEc && fs::exists(standaloneOut)) {
+                        slaveResults[sIdx].type = SlaveStorageType::STANDALONE;
+                        slaveResults[sIdx].success = true;
+                    } else {
+                        slaveResults[sIdx].type = SlaveStorageType::NONE;
+                        slaveResults[sIdx].success = false;
+                        slaveResults[sIdx].error = cpEc ? cpEc.message() : "Failed to copy slave as standalone file";
                     }
                 }
             }
 
-            totalOriginal += grpOrig.load();
-            totalCompressed += grpComp.load();
-            deltaCount += grpDeltas.load();
-            stats.originalBytes += grpOrig.load();
-            stats.archivedBytes += grpComp.load();
-            stats.deltas += grpDeltas.load();
-        }
+            // Record into manifest ONLY if successfully stored
+            for (size_t sIdx = 0; sIdx < grp.slaves.size(); ++sIdx) {
+                const auto& slave = grp.slaves[sIdx];
+                const auto& res = slaveResults[sIdx];
+                if (!res.success) {
+                    std::cerr << "Error: Image '" << slave.filename << "' could not be stored in archive: " << res.error << "\n";
+                    pipelineSuccess = false;
+                    break;
+                }
 
-        clusterStats.push_back(stats);
+                ImageManifestEntry sEntry;
+                sEntry.originalFilename = slave.filename;
+                sEntry.clusterFolder = cluster.folderName;
+                sEntry.originalSizeBytes = slave.fileSize;
+                sEntry.sha256Checksum = MetadataArchive::computeSha256(slave.filepath);
+                sEntry.isMaster = false;
+                sEntry.masterReference = (res.type == SlaveStorageType::DELTA) ? grp.master.filename : "";
+                manifest.entries.push_back(sEntry);
+            }
+        }
+        if (!pipelineSuccess) break;
     }
 
-    auto toSizeStr = [](size_t bytes) -> std::string {
-        std::ostringstream ss;
-        if (bytes >= 1024 * 1024 * 1024) {
-            ss << std::fixed << std::setprecision(2) << (bytes / 1024.0 / 1024.0 / 1024.0) << " GB (" << bytes << " bytes)";
-        } else if (bytes >= 1024 * 1024) {
-            ss << std::fixed << std::setprecision(2) << (bytes / 1024.0 / 1024.0) << " MB (" << bytes << " bytes)";
-        } else {
-            ss << std::fixed << std::setprecision(1) << (bytes / 1024.0) << " KB (" << bytes << " bytes)";
-        }
-        return ss.str();
-    };
-
-    std::cout << "\n================ ARCHIVAL SUMMARY ================\n";
-    std::cout << "Total Images Processed: " << images.size() << "\n";
-    std::cout << "Master Images Stored:   " << masterCount << "\n";
-    std::cout << "Delta Files Created:    " << deltaCount << "\n";
-    std::cout << "--------------------------------------------------\n";
-    std::cout << "Per-Cluster Breakdown:\n";
-    for (const auto& fs : clusterStats) {
-        double sav = (fs.originalBytes > 0) ? (1.0 - static_cast<double>(fs.archivedBytes) / fs.originalBytes) * 100.0 : 0.0;
-        std::cout << "  * [" << fs.folderName << "]\n"
-                  << "      Type / Description: " << fs.description << "\n"
-                  << "      Masters: " << fs.masters << ", Deltas: " << fs.deltas << "\n"
-                  << "      Original: " << toSizeStr(fs.originalBytes) 
-                  << " -> Archived: " << toSizeStr(fs.archivedBytes) 
-                  << " (Saved: " << std::fixed << std::setprecision(1) << sav << "%)\n";
+    if (!pipelineSuccess) {
+        fs::remove_all(stagingDir, ec);
+        std::cerr << "Error: Archive generation failed during image processing. Aborting.\n";
+        return false;
     }
-    std::cout << "--------------------------------------------------\n";
-    std::cout << "Overall Original Size:  " << toSizeStr(totalOriginal) << "\n";
-    std::cout << "Overall Archived Size:  " << toSizeStr(totalCompressed) << "\n";
-    double totalSavings = (totalOriginal > 0) ? (1.0 - static_cast<double>(totalCompressed) / totalOriginal) * 100.0 : 0.0;
-    std::cout << "Net Disk Space Saved:   " << std::fixed << std::setprecision(2) << totalSavings << "%\n";
-    std::cout << "==================================================\n";
+
+    std::string errorMsg;
+    bool packaged = MetadataArchive::createArchiveFromDirectory(stagingDir.string(), finalArchivePath, &manifest, &errorMsg);
+    fs::remove_all(stagingDir, ec);
+
+    if (!packaged) {
+        std::cerr << "Error: Failed to package archive: " << errorMsg << "\n";
+        return false;
+    }
+
+    std::cout << "Archive generated successfully: " << fs::path(finalArchivePath).filename().string() << "\n";
+    return true;
 }
 
 void commandDecompress(const std::string& master, const std::string& delta, const std::string& out) {
@@ -321,45 +323,70 @@ void commandDecompress(const std::string& master, const std::string& delta, cons
     }
 }
 
-void commandRestoreArchive(const std::string& archiveDir, const std::string& reconDir) {
-    if (!fs::exists(archiveDir)) {
-        std::cerr << "Archive directory does not exist: " << archiveDir << "\n";
-        return;
+bool commandRestoreArchive(const std::string& archivePath, const std::string& reconDir) {
+    if (!fs::exists(archivePath)) {
+        std::cerr << "Error: Archive path does not exist: " << archivePath << "\n";
+        return false;
     }
 
-    fs::create_directories(reconDir);
-    std::cout << "=== Reconstructing Dataset from Archive ===\n";
-    std::cout << "Archive Directory: " << archiveDir << "\n";
-    std::cout << "Target Directory:  " << reconDir << "\n\n";
+    fs::path workingSourceDir;
+    bool isTemporaryDir = false;
+    std::error_code ec;
+
+    if (fs::is_regular_file(archivePath)) {
+        if (!MetadataArchive::isValidArchive(archivePath)) {
+            std::cerr << "Error: Invalid, corrupted, or truncated archive file: " << archivePath << "\n";
+            return false;
+        }
+
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dist(100000, 999999);
+        fs::path tempExtract = fs::temp_directory_path() / ("blockdedup_recon_" + std::to_string(dist(gen)));
+
+        std::string err;
+        if (!MetadataArchive::extractArchive(archivePath, tempExtract.string(), &err)) {
+            std::cerr << "Error: Failed to extract archive: " << err << "\n";
+            fs::remove_all(tempExtract, ec);
+            return false;
+        }
+
+        workingSourceDir = tempExtract;
+        isTemporaryDir = true;
+    } else if (fs::is_directory(archivePath)) {
+        workingSourceDir = fs::path(archivePath);
+    } else {
+        std::cerr << "Error: Unsupported archive path type: " << archivePath << "\n";
+        return false;
+    }
+
+    fs::create_directories(reconDir, ec);
 
     std::vector<fs::path> clusterDirs;
-    for (const auto& entry : fs::directory_iterator(archiveDir)) {
+    for (const auto& entry : fs::directory_iterator(workingSourceDir, ec)) {
         if (entry.is_directory()) {
             clusterDirs.push_back(entry.path());
         }
     }
     std::sort(clusterDirs.begin(), clusterDirs.end());
 
-    size_t totalRestored = 0;
-    size_t mastersCount = 0;
-    size_t deltasCount = 0;
-    size_t standalonesCount = 0;
+    std::atomic<size_t> totalRestored{0};
+    std::atomic<size_t> deltaFailures{0};
+    size_t standaloneFailures = 0;
+    size_t masterFailures = 0;
 
     for (const auto& cDir : clusterDirs) {
-        std::cout << ">>> Reconstructing cluster: " << cDir.filename().string() << "\n";
-
-        // Find all masters in this cluster
         std::vector<fs::path> masters;
         std::vector<fs::path> deltas;
         std::vector<fs::path> standalones;
 
-        for (const auto& file : fs::directory_iterator(cDir)) {
+        for (const auto& file : fs::directory_iterator(cDir, ec)) {
             std::string name = file.path().filename().string();
             if (name.size() > 7 && name.substr(name.size() - 7) == ".bdelta") {
                 deltas.push_back(file.path());
             } else if (name.rfind("master_", 0) == 0) {
                 masters.push_back(file.path());
-            } else if (file.is_regular_file()) {
+            } else if (file.is_regular_file() && name != ARCHIVE_MANIFEST_FILENAME) {
                 standalones.push_back(file.path());
             }
         }
@@ -367,30 +394,37 @@ void commandRestoreArchive(const std::string& archiveDir, const std::string& rec
         // Copy standalone files
         for (const auto& sa : standalones) {
             fs::path dest = fs::path(reconDir) / sa.filename();
-            fs::copy_file(sa, dest, fs::copy_options::overwrite_existing);
-            standalonesCount++;
-            totalRestored++;
+            std::error_code copyEc;
+            fs::copy_file(sa, dest, fs::copy_options::overwrite_existing, copyEc);
+            if (copyEc || !fs::exists(dest)) {
+                std::cerr << "Error: Failed to copy standalone image: " << sa.filename().string() << "\n";
+                standaloneFailures++;
+            } else {
+                totalRestored++;
+            }
         }
 
         // Restore original names for masters
         for (const auto& m : masters) {
             std::string mName = m.filename().string();
-            std::string origName = mName.substr(7); // strip "master_"
+            std::string origName = mName.substr(7);
             fs::path dest = fs::path(reconDir) / origName;
-            fs::copy_file(m, dest, fs::copy_options::overwrite_existing);
-            mastersCount++;
-            totalRestored++;
+            std::error_code copyEc;
+            fs::copy_file(m, dest, fs::copy_options::overwrite_existing, copyEc);
+            if (copyEc || !fs::exists(dest)) {
+                std::cerr << "Error: Failed to copy master image: " << m.filename().string() << "\n";
+                masterFailures++;
+            } else {
+                totalRestored++;
+            }
         }
 
         // Decompress all deltas against available master images
-        std::cout << "  Restoring " << deltas.size() << " delta images...\n";
-        std::atomic<size_t> dProgress{0};
-
         #pragma omp parallel for schedule(dynamic)
         for (size_t dIdx = 0; dIdx < deltas.size(); ++dIdx) {
             const auto& d = deltas[dIdx];
             std::string dName = d.filename().string();
-            std::string stem = dName.substr(0, dName.size() - 7); // strip ".bdelta"
+            std::string stem = dName.substr(0, dName.size() - 7);
             auto marker = stem.find("@@");
             std::string targetName = marker == std::string::npos ? stem : stem.substr(marker + 2);
             fs::path dest = fs::path(reconDir) / targetName;
@@ -408,37 +442,54 @@ void commandRestoreArchive(const std::string& archiveDir, const std::string& rec
                 }
             }
 
-            if (restored) {
-                #pragma omp atomic
-                deltasCount++;
-                #pragma omp atomic
+            if (restored && fs::exists(dest)) {
                 totalRestored++;
             } else {
+                deltaFailures++;
                 #pragma omp critical
                 {
-                    std::cerr << "  [Error] Failed to reconstruct delta: " << dName << "\n";
-                }
-            }
-
-            size_t p = ++dProgress;
-            if (p % 10 == 0 || p == deltas.size()) {
-                #pragma omp critical
-                {
-                    std::cout << "    [Progress] " << p << " / " << deltas.size() << " deltas restored\n";
+                    std::cerr << "Error: Failed to reconstruct delta: " << dName << "\n";
                 }
             }
         }
     }
 
-    std::cout << "\n================ RECONSTRUCTION SUMMARY ================\n";
-    std::cout << "Total Images Restored:  " << totalRestored << "\n";
-    std::cout << "  - Direct Masters:     " << mastersCount << "\n";
-    std::cout << "  - Decompressed Deltas:" << deltasCount << "\n";
-    std::cout << "  - Standalone Copies:  " << standalonesCount << "\n";
-    std::cout << "Output Folder:          " << reconDir << "\n";
-    std::cout << "========================================================\n";
+    bool manifestVerified = true;
+    auto manifestOpt = MetadataArchive::readManifest(workingSourceDir.string());
+    if (manifestOpt) {
+        if (totalRestored.load() != manifestOpt->totalOriginalImages) {
+            std::cerr << "Error: Restored image count (" << totalRestored.load() 
+                      << ") does not match manifest count (" << manifestOpt->totalOriginalImages << ")!\n";
+            manifestVerified = false;
+        }
+
+        std::vector<std::string> mismatches;
+        if (!MetadataArchive::verifyRestoredImages(reconDir, *manifestOpt, mismatches)) {
+            std::cerr << "Error: " << mismatches.size() << " restored files failed verification:\n";
+            for (const auto& m : mismatches) {
+                std::cerr << "  - " << m << "\n";
+            }
+            manifestVerified = false;
+        }
+    }
+
+    if (isTemporaryDir) {
+        fs::remove_all(workingSourceDir, ec);
+    }
+
+    bool overallSuccess = (standaloneFailures == 0 && masterFailures == 0 &&
+                           deltaFailures.load() == 0 && manifestVerified);
+
+    if (!overallSuccess) {
+        std::cerr << "Restoration FAILED: Restoration completed with errors. Target may be incomplete.\n";
+        return false;
+    }
+
+    std::cout << "Restoration completed successfully: " << totalRestored.load() << " images restored to " << reconDir << "\n";
+    return true;
 }
 
+#ifndef BLOCKDEDUP_TEST_RUNNER
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         printUsage(argv[0]);
@@ -454,11 +505,15 @@ int main(int argc, char* argv[]) {
         commandScan(argv[2]);
     } else if (cmd == "compress" && argc >= 4) {
         uint8_t tol = (argc >= 5) ? static_cast<uint8_t>(std::stoi(argv[4])) : 28;
-        commandCompress(argv[2], argv[3], tol);
+        if (!commandCompress(argv[2], argv[3], tol)) {
+            return 1;
+        }
     } else if (cmd == "decompress" && argc >= 5) {
         commandDecompress(argv[2], argv[3], argv[4]);
     } else if (cmd == "restore" && argc >= 4) {
-        commandRestoreArchive(argv[2], argv[3]);
+        if (!commandRestoreArchive(argv[2], argv[3])) {
+            return 1;
+        }
     } else if (cmd == "demo") {
         std::string dir = (argc >= 3) ? argv[2] : "sample";
         std::cout << "\n>>> STEP 1: Inspect Sample Image Telemetry <<<\n";
@@ -472,12 +527,16 @@ int main(int argc, char* argv[]) {
         commandScan(dir);
 
         fs::path in = dir;
-        fs::path archive = in.parent_path() / (in.filename().string() + "_archive");
+        fs::path archive = in.parent_path() / (in.filename().string() + "_archive.meta");
         fs::path restored = in.parent_path() / (in.filename().string() + "_restored");
         std::cout << "\n>>> STEP 4: Compress <<<\n";
-        commandCompress(dir, archive.string(), 28);
+        if (!commandCompress(dir, archive.string(), 28)) {
+            return 1;
+        }
         std::cout << "\n>>> STEP 5: Restore <<<\n";
-        commandRestoreArchive(archive.string(), restored.string());
+        if (!commandRestoreArchive(archive.string(), restored.string())) {
+            return 1;
+        }
     } else {
         printUsage(argv[0]);
         return 1;
@@ -485,3 +544,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+#endif

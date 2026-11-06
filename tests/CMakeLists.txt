@@ -13,3 +13,7 @@ target_link_libraries(test_rolling_hash PRIVATE blockdedup Catch2::Catch2WithMai
 
 include(Catch)
 catch_discover_tests(test_rolling_hash)
+
+add_executable(test_custom_archive test_custom_archive.cpp)
+target_link_libraries(test_custom_archive PRIVATE blockdedup)
+add_test(NAME test_custom_archive COMMAND test_custom_archive)

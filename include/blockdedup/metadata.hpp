@@ -6,6 +6,7 @@
 #include <optional>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 
 namespace blockdedup {
 
@@ -68,6 +69,85 @@ public:
     static std::map<std::string, std::string> computeMetadataDelta(
         const ImageMetadata& target,
         const ImageMetadata& base
+    );
+};
+
+// ============================================================================
+// Archive Packaging & Custom Extension (.meta) Support
+// ============================================================================
+
+inline constexpr const char* CUSTOM_ARCHIVE_EXTENSION = ".meta";
+inline constexpr const char* ZIP_ARCHIVE_EXTENSION = ".zip";
+inline constexpr const char* ARCHIVE_MANIFEST_FILENAME = "metadata_manifest.json";
+
+// Note on Confidentiality:
+// The .meta archive format uses standard ZIP compression with a custom extension.
+// It provides format obfuscation against accidental opening, but NOT cryptographic
+// confidentiality. Archive utilities (e.g. unzip, 7-zip) can inspect inner filenames
+// if renamed. Authenticated encryption (e.g. AES-256-GCM) is required for true confidentiality.
+inline constexpr bool IS_CRYPTOGRAPHICALLY_CONFIDENTIAL = false;
+
+struct ImageManifestEntry {
+    std::string originalFilename;
+    std::string clusterFolder;
+    size_t originalSizeBytes = 0;
+    std::string sha256Checksum;
+    bool isMaster = false;
+    std::string masterReference; // Master filename if this is a delta, empty if standalone
+};
+
+struct ArchiveManifest {
+    std::string formatVersion = "1.0";
+    std::string formatTag = "blockdedup.meta";
+    int64_t creationTimestamp = 0;
+    size_t totalOriginalImages = 0;
+    uint8_t tolerance = 0;
+    std::vector<ImageManifestEntry> entries;
+};
+
+class MetadataArchive {
+public:
+    static constexpr bool IS_CRYPTOGRAPHICALLY_CONFIDENTIAL = false;
+
+    // Ensure filename ends with .meta, replacing .zip or appending if missing
+    static std::string ensureMetaExtension(const std::string& path);
+
+    // Prevent accidental overwriting of existing archives; generates non-colliding name if needed
+    static std::string sanitizeOutputPath(const std::string& requestedPath, bool preventOverwrite = true);
+
+    // Calculate SHA-256 hash for byte-level integrity verification
+    static std::string computeSha256(const std::string& filepath);
+    static std::string computeSha256(const uint8_t* data, size_t length);
+
+    // Safe extraction path verification (rejects traversal, UNC, drive letters, absolute paths)
+    static bool isSafeEntryPath(const std::string& entryPath);
+
+    // Automatically package an existing generated directory into a ZIP archive saved with .meta extension
+    static bool createArchiveFromDirectory(
+        const std::string& stagingDir,
+        const std::string& outputArchivePath,
+        const ArchiveManifest* manifest = nullptr,
+        std::string* errorMsg = nullptr
+    );
+
+    // Extract a .meta (or .zip) archive into destination directory with strict safety checks
+    static bool extractArchive(
+        const std::string& archivePath,
+        const std::string& destinationDir,
+        std::string* errorMsg = nullptr
+    );
+
+    // Format identification and complete structural validation
+    static bool isValidArchive(const std::string& archivePath);
+    static bool isCustomMetaArchive(const std::string& archivePath);
+
+    // Manifest read/write/verification
+    static bool writeManifest(const std::string& directory, const ArchiveManifest& manifest);
+    static std::optional<ArchiveManifest> readManifest(const std::string& directory);
+    static bool verifyRestoredImages(
+        const std::string& restoredDir,
+        const ArchiveManifest& manifest,
+        std::vector<std::string>& mismatchedFiles
     );
 };
 
