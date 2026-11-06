@@ -6,6 +6,12 @@ build/
 *.so
 *.dll
 *.exe
+ponytail/
+masters/
+dataset/
+archive_dataset/
+restored_dataset/
+.cache/
 
 # CMake
 CMakeCache.txt
@@ -16,3 +22,6 @@ cmake_install.cmake
 .vscode/
 .idea/
 .DS_Store
+
+# Testing
+sample/
