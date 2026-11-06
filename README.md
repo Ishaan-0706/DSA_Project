@@ -43,6 +43,19 @@ The program is built at `./build/image_dedup_cli`. Add `-DBUILD_TESTING=OFF` to 
 | `decompress <master> <delta> <out_image>` | Rebuild one image |
 | `restore <archive_dir> <out_dir>` | Rebuild every image in an archive |
 | `demo [image_dir]` | Run inspect, tree, scan, compress and restore in one go |
+| `(no command)` or `tui` | Archive a folder, or restore an archive later |
+
+## Interactive
+
+Run the program with no arguments and choose archive or restore.
+
+```sh
+./build/image_dedup_cli
+```
+
+**Archive.** Give a photo folder. An archive is the smaller copy written next to it, named `<folder>_archive`. One full photo is kept for each group of similar shots. The other shots are stored as differences from that photo. After the archive holds every photo, the original folder is removed. No restored folder is written.
+
+**Restore.** Choose restore and give the archive folder. `trip_archive` is rebuilt into `trip`, next to the archive. After every file is back, the archive folder is removed.
 
 ## Try it
 

@@ -11,5 +11,10 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(test_rolling_hash test_rolling_hash.cpp)
 target_link_libraries(test_rolling_hash PRIVATE blockdedup Catch2::Catch2WithMain)
 
+add_executable(test_output_paths test_output_paths.cpp)
+target_include_directories(test_output_paths PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(test_output_paths PRIVATE Catch2::Catch2WithMain)
+
 include(Catch)
 catch_discover_tests(test_rolling_hash)
+catch_discover_tests(test_output_paths)

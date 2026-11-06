@@ -2,6 +2,7 @@
 #include "blockdedup/image_tree.hpp"
 #include "blockdedup/image_similarity.hpp"
 #include "blockdedup/delta_compressor.hpp"
+#include "blockdedup/output_paths.hpp"
 
 #include <iostream>
 #include <vector>
@@ -10,13 +11,20 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 using namespace blockdedup;
 
 void printUsage(const char* prog) {
-    std::cout << "Usage: " << prog << " <command> [arguments...]\n\n"
+    std::cout << "Usage: " << prog << "\n"
+              << "       " << prog << " <command> [arguments...]\n\n"
+              << "With no command, choose archive or restore.\n"
+              << "Archive writes <name>_archive, then removes the photo folder.\n"
+              << "Restore rebuilds trip_archive back into trip, then removes the archive.\n\n"
               << "Commands:\n"
+              << "  (no command) | tui                 Archive a folder, or restore an archive\n"
               << "  inspect <image_path>               Parse & inspect EXIF/XMP & GPS telemetry\n"
               << "  tree <image_dir>                   Build & display Spatiotemporal Cluster Tree\n"
               << "  scan <image_dir>                   Tree clustering + visual scanning (find Masters & Slaves)\n"
@@ -24,7 +32,8 @@ void printUsage(const char* prog) {
               << "                                     Master/delta archive. Default tolerance 28\n"
               << "  decompress <master> <delta> <out>  Reconstruct one image from a master and a delta\n"
               << "  restore <archive_dir> <out_dir>    Reconstruct every image in an archive\n"
-              << "  demo [image_dir]                   Inspect, cluster, compress, and restore\n\n";
+              << "  demo [image_dir]                   Inspect, cluster, compress, and restore\n"
+              << "  help                               Show this list\n\n";
 }
 
 void commandInspect(const std::string& path) {
@@ -439,13 +448,272 @@ void commandRestoreArchive(const std::string& archiveDir, const std::string& rec
     std::cout << "========================================================\n";
 }
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printUsage(argv[0]);
+std::string trimCopy(std::string text) {
+    auto notSpace = [](unsigned char c) { return std::isspace(c) == 0; };
+    auto begin = std::find_if(text.begin(), text.end(), notSpace);
+    auto end = std::find_if(text.rbegin(), text.rend(), notSpace).base();
+    if (begin >= end) return {};
+    return std::string(begin, end);
+}
+
+std::string normalizeFolderInput(std::string line) {
+    line = trimCopy(std::move(line));
+    if (line.size() >= 2) {
+        char open = line.front();
+        char close = line.back();
+        if ((open == '"' && close == '"') || (open == '\'' && close == '\'')) {
+            line = trimCopy(line.substr(1, line.size() - 2));
+        }
+    }
+    if (line == "~" || line.rfind("~/", 0) == 0) {
+        const char* home = std::getenv("HOME");
+        if (home != nullptr && home[0] != '\0') line.replace(0, 1, home);
+    }
+    return line;
+}
+
+bool pathOccupied(const fs::path& path) {
+    std::error_code ec;
+    fs::file_status status = fs::symlink_status(path, ec);
+    return !ec && status.type() != fs::file_type::not_found;
+}
+
+bool readLine(std::string& line) {
+    if (!std::getline(std::cin, line)) {
+        std::cout << "\n";
+        return false;
+    }
+    line = normalizeFolderInput(std::move(line));
+    return true;
+}
+
+bool quitWord(const std::string& line) {
+    return line.empty() || line == "q" || line == "Q";
+}
+
+bool readFolder(const char* prompt, fs::path& input) {
+    while (true) {
+        std::cout << prompt << std::flush;
+        std::string line;
+        if (!readLine(line)) return false;
+        if (quitWord(line)) return false;
+
+        fs::path raw(line);
+        std::error_code ec;
+        if (!fs::exists(raw, ec) || ec) {
+            std::cout << "No folder at that path. Check the path and try again.\n";
+            continue;
+        }
+        if (!fs::is_directory(raw, ec) || ec) {
+            std::cout << "That path is a file, not a folder. Give a folder path.\n";
+            continue;
+        }
+        input = fs::absolute(raw).lexically_normal();
+        if (input.filename().empty()) input = input.parent_path();
+        return true;
+    }
+}
+
+bool confirmedYes(const char* prompt) {
+    std::cout << prompt << std::flush;
+    std::string answer;
+    if (!readLine(answer)) {
+        std::cout << "Stopped. Nothing was changed.\n";
+        return false;
+    }
+    if (answer != "y" && answer != "Y") {
+        std::cout << "Stopped. Nothing was changed.\n";
+        return false;
+    }
+    return true;
+}
+
+size_t countStoredFiles(const fs::path& root) {
+    size_t count = 0;
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) return 0;
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    fs::recursive_directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (it->is_regular_file()) count++;
+    }
+    return count;
+}
+
+int runArchive() {
+    std::cout << "\nThe photo folder is removed after the archive is written.\n"
+              << "Only <name>_archive is left. Choose Restore later to get the photos back.\n\n";
+
+    fs::path input;
+    if (!readFolder("Photo folder: ", input)) return 0;
+
+    std::vector<ImageMetadata> images = collectImages(input.string());
+    if (images.empty()) {
+        std::cout << "No photos in that folder.\n"
+                  << "This looks for jpg, png, webp, bmp, and common camera raw files.\n";
         return 1;
     }
 
+    OutputPaths outs = outputPathsFor(input);
+    if (outs.clashesWithSource || samePath(outs.archive, input)) {
+        std::cout << "Stopped. The archive path is the same as the photo folder, so nothing was deleted.\n";
+        return 1;
+    }
+
+    std::cout << "\nPhotos found: " << images.size() << "\n\n"
+              << "Archive:  " << outs.archive.string() << "\n"
+              << "Removes:  " << input.string() << "\n";
+
+    if (pathOccupied(outs.archive)) {
+        if (!confirmedYes("\nReplace the existing archive? [y/N] ")) return 0;
+        outs = outputPathsFor(input);
+        if (outs.clashesWithSource || samePath(outs.archive, input)) {
+            std::cout << "Stopped. The archive path is the same as the photo folder, so nothing was deleted.\n";
+            return 1;
+        }
+        std::error_code rm;
+        fs::remove_all(outs.archive, rm);
+        if (rm) {
+            std::cout << "Could not replace the archive folder.\n"
+                      << rm.message() << "\n"
+                      << "Nothing new was written. The photo folder was not changed.\n";
+            return 1;
+        }
+    }
+
+    std::cout << "\nArchiving…\n";
+    commandCompress(input.string(), outs.archive.string(), 28);
+    size_t stored = countStoredFiles(outs.archive);
+    if (!pathOccupied(outs.archive) || stored < images.size()) {
+        std::cout << "\nThe archive does not contain every photo, so the photo folder was kept.\n"
+                  << "Archive: " << outs.archive.string() << "\n";
+        return 1;
+    }
+
+    std::error_code rm;
+    fs::remove_all(input, rm);
+    if (rm || pathOccupied(input)) {
+        std::cout << "\nThe archive was written, but the photo folder could not be removed.\n"
+                  << "Archive: " << outs.archive.string() << "\n"
+                  << "Photos:  " << input.string() << "\n";
+        return 1;
+    }
+
+    fs::path restored = outs.restored;
+    if (pathOccupied(restored) && !samePath(restored, input) && !samePath(restored, outs.archive)) {
+        std::error_code restoredRm;
+        fs::remove_all(restored, restoredRm);
+        if (restoredRm || pathOccupied(restored)) {
+            std::cout << "\nDone. The photo folder was removed, but the old restored folder is still there.\n"
+                      << "Archive:  " << outs.archive.string() << "\n"
+                      << "Restored: " << restored.string() << "\n";
+            return 1;
+        }
+    }
+
+    std::cout << "\nDone.\n\n"
+              << "Archive: " << outs.archive.string() << "\n"
+              << "Removed: " << input.string() << "\n\n"
+              << "Only the archive is left. Choose Restore later and give that archive path.\n";
+    return 0;
+}
+
+int runRestore() {
+    std::cout << "\nGive the archive folder. trip_archive is rebuilt into trip, next to it.\n"
+              << "The archive is removed after the photos are back.\n\n";
+
+    fs::path archive;
+    if (!readFolder("Archive folder: ", archive)) return 0;
+
+    fs::path dest = restoreDestinationFor(archive);
+    if (samePath(dest, archive)) {
+        std::cout << "Stopped. The restored photos would replace the archive, so nothing was written.\n";
+        return 1;
+    }
+
+    size_t stored = countStoredFiles(archive);
+    std::cout << "\nArchive: " << archive.string() << "\n"
+              << "Photos:  " << dest.string() << "\n"
+              << "Removes: " << archive.string() << " after the photos are back\n";
+
+    if (pathOccupied(dest)) {
+        if (!confirmedYes("\nReplace the photos already in that folder? [y/N] ")) return 0;
+        if (samePath(dest, archive)) {
+            std::cout << "Stopped. The restored photos would replace the archive, so nothing was written.\n";
+            return 1;
+        }
+        std::error_code rm;
+        fs::remove_all(dest, rm);
+        if (rm) {
+            std::cout << "Could not replace the photo folder.\n" << rm.message() << "\n";
+            return 1;
+        }
+    }
+
+    std::cout << "\nRestoring every photo…\n";
+    commandRestoreArchive(archive.string(), dest.string());
+    size_t restoredCount = collectImages(dest.string()).size();
+    if (restoredCount == 0 || countStoredFiles(dest) < stored) {
+        std::cout << "\nThe photos were not all rebuilt, so the archive was kept.\n"
+                  << "Archive: " << archive.string() << "\n"
+                  << "Photos:  " << dest.string() << "\n";
+        return 1;
+    }
+
+    std::error_code rm;
+    fs::remove_all(archive, rm);
+    if (rm || pathOccupied(archive)) {
+        std::cout << "\nThe photos were rebuilt, but the archive could not be removed.\n"
+                  << "Photos:  " << dest.string() << "\n"
+                  << "Archive: " << archive.string() << "\n";
+        return 1;
+    }
+
+    std::cout << "\nDone.\n\n"
+              << "Photos:  " << dest.string() << "\n"
+              << "         " << restoredCount << (restoredCount == 1 ? " photo\n" : " photos\n")
+              << "Removed: " << archive.string() << "\n";
+    return 0;
+}
+
+int runTui() {
+    std::cout << "BlockDedup\n\n"
+              << "1  Archive photos\n"
+              << "   The photo folder is removed. Only <name>_archive is left.\n\n"
+              << "2  Restore photos\n"
+              << "   Give the archive folder. trip_archive is rebuilt into trip,\n"
+              << "   then the archive is removed.\n\n"
+              << "Press Enter on an empty line to quit.\n\n";
+
+    while (true) {
+        std::cout << "Choice: " << std::flush;
+        std::string choice;
+        if (!readLine(choice)) return 0;
+        if (quitWord(choice)) return 0;
+        if (choice == "1") return runArchive();
+        if (choice == "2") return runRestore();
+        std::cout << "Type 1 to archive, or 2 to restore.\n";
+    }
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2 || std::string(argv[1]) == "tui") {
+        if (!isatty(STDIN_FILENO)) {
+            printUsage(argv[0]);
+            return 1;
+        }
+        return runTui();
+    }
+
     std::string cmd = argv[1];
+    if (cmd == "help" || cmd == "-h" || cmd == "--help") {
+        printUsage(argv[0]);
+        return 0;
+    }
     if (cmd == "inspect" && argc >= 3) {
         commandInspect(argv[2]);
     } else if (cmd == "tree" && argc >= 3) {
